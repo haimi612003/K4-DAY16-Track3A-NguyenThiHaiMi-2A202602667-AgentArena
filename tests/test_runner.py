@@ -68,7 +68,7 @@ from arena.scorer import MODEL_OUTPUT_FIELD, score_run
 from arena.tools import Tools
 from arena.trace import Trace
 
-from harness.agent import ReActAgent
+from harness.agent import ReActAgent, _with_real_addendum
 from harness.middleware import Middleware
 
 
@@ -1404,7 +1404,8 @@ def test_the_scored_prompt_addendum_is_off_by_default_and_reaches_the_model_when
     plain = ScriptedModel('THOUGHT: x\nFINAL: {"abstain": true, "claims": []}')
     run_brief(BRIEF, model=plain, corpus=CORPUS, seed=11, config=QUIET)
     sent = plain.calls[0][0][0]["content"]
-    assert sent == ARENA_SYSTEM_PROMPT
+    # The harness ALWAYS appends its own addendum (the runner's stays opt-in).
+    assert sent == _with_real_addendum(ARENA_SYSTEM_PROMPT)
 
     nudged = ScriptedModel('THOUGHT: x\nFINAL: {"abstain": true, "claims": []}')
     run_brief(

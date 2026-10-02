@@ -559,7 +559,10 @@ def test_an_action_written_under_a_final_wins_at_most_twice():
     assert agent.last_context.stop_reason == "final"
     assert report["answer"].startswith("Cam kết")
     model_calls = [e for e in _events(trace.to_jsonl()) if e["event"] == "model_call"]
-    assert len(model_calls) == MAX_FINAL_DEFERRALS + 1, len(model_calls)
+    # GENUINE_FINAL abstains without a fetch, so the early-FINAL guard also
+    # sends it back MAX_EARLY_FINAL_REJECTIONS times before taking it.
+    from harness.agent import MAX_EARLY_FINAL_REJECTIONS
+    assert len(model_calls) == MAX_FINAL_DEFERRALS + MAX_EARLY_FINAL_REJECTIONS + 1, len(model_calls)
     searches = [
         e
         for e in _events(trace.to_jsonl())
@@ -1015,7 +1018,10 @@ def test_a_model_that_quotes_the_whole_addendum_keeps_working():
     ]
     assert searches, "quoting the addendum ended the run on turn one"
     assert searches[0]["query"] == "SLA nội thành"
-    assert model.turns == 2
+    # Turn 2 abstains without reading one document while budget remains, so
+    # the early-FINAL guard sends it back (at most MAX_EARLY_FINAL_REJECTIONS).
+    from harness.agent import MAX_EARLY_FINAL_REJECTIONS
+    assert model.turns == 2 + MAX_EARLY_FINAL_REJECTIONS
 
 
 def test_the_addendum_is_appended_not_substituted():

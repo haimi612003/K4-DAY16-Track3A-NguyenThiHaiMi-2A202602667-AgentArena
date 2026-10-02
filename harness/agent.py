@@ -109,6 +109,7 @@ from dataclasses import dataclass, field
 
 from arena.model import (
     ARENA_SYSTEM_PROMPT,
+    MockModel,
     TOOL_ERROR_PREFIX,
     parse_output,
 )
@@ -273,6 +274,46 @@ def real_model_system_prompt(base: str = ARENA_SYSTEM_PROMPT) -> str:
 #: must pass as `system_prompt`; not the default (see the module
 #: docstring for the measured reason).
 ARENA_SYSTEM_PROMPT_REAL = real_model_system_prompt()
+
+
+def _is_mock(model) -> bool:
+    """True only for `MockModel`, bare or inside the runner's provenance wrapper.
+
+    Anything else — a real endpoint, or an unknown object — counts as real,
+    so the scored path can never lose the addendum by mistake.
+    """
+    return isinstance(getattr(model, "inner", model), MockModel)
+
+
+def _with_real_addendum(prompt: str) -> str:
+    """`prompt` with the addendum appended, unless it already carries it."""
+    prompt = prompt if isinstance(prompt, str) else ""
+    if REAL_MODEL_PROMPT_ADDENDUM.strip() in prompt:
+        return prompt
+    return real_model_system_prompt(prompt)
+
+
+#: How many times ONE RUN may send a premature FINAL back. A FINAL is
+#: premature when the model has not called a single tool, or abstains
+#: without having read one document in full while budget remains. Two is
+#: enough to get a lazy model searching; more would burn turns on a model
+#: that has genuinely decided.
+MAX_EARLY_FINAL_REJECTIONS = 2
+
+#: Sent back (as a user turn) instead of accepting a premature FINAL.
+#: Deliberately carries no `FINALIZE_SENTINEL` — that token means "stop".
+EARLY_FINAL_NUDGE_NO_TOOLS = (
+    "Chưa được kết luận: bạn chưa gọi công cụ nào. Kho tài liệu nội bộ chắc chắn "
+    "có tài liệu liên quan. Hãy viết một dòng ACTION gọi search ngay bây giờ với "
+    "các từ khoá chính của câu hỏi, rồi dùng fetch_doc đọc toàn văn tài liệu phù "
+    "hợp nhất trước khi viết FINAL."
+)
+EARLY_FINAL_NUDGE_NO_FETCH = (
+    "Chưa được kết luận là không đủ căn cứ: bạn chưa đọc toàn văn tài liệu nào. "
+    "Câu hỏi thường không dùng cùng từ ngữ với tài liệu chứa đáp án. Hãy search "
+    "lại bằng thuật ngữ nội bộ khác (tên quy trình, tên chính sách, tên phòng ban, "
+    "từ đồng nghĩa), rồi dùng fetch_doc đọc tài liệu phù hợp nhất trước khi viết FINAL."
+)
 
 #: `output_text` is clamped to this before it is stamped on `model_call`.
 #: `Trace.emit` truncates any record over 90,000 characters, and a
@@ -480,13 +521,23 @@ class ReActAgent:
         # one already, so a caller that does not pass one still works.
         self.corpus = corpus if corpus is not None else getattr(tools, "_corpus", None)
         self.max_steps = max(1, int(max_steps))
-        self.system_prompt = system_prompt
+        # The frozen runner ALWAYS passes its own `system_prompt`, so a
+        # default here never reaches the scored run. Append the addendum to
+        # whatever arrives. Measured on the live leaderboard: without it the
+        # real model wrote FINAL on turn one with zero tool calls
+        # (`single_model_call`) and every entry tied at 39.47.
+        # The mock is the one exception: there the addendum is behaviourally
+        # neutral but costs ~2 points of estimated tokens (module docstring).
+        self.system_prompt = (
+            system_prompt if _is_mock(model) else _with_real_addendum(system_prompt)
+        )
         self.last_context: AgentContext | None = None
         # Per-run bookkeeping for the two `_parse` guards. Reset in
         # `run()`; kept on the agent rather than in `ctx.state`, which
         # belongs to the layers.
         self._final_deferrals = 0
         self._refused_final: dict | None = None
+        self._early_rejections = 0
 
     # -- the run -------------------------------------------------------
 
@@ -503,6 +554,8 @@ class ReActAgent:
         self.last_context = ctx
         self._final_deferrals = 0
         self._refused_final = None
+        self._early_rejections = 0
+        tools_used: set = set()
 
         self.trace.emit("agent_start", brief_id=str(brief.get("brief_id", "")))
 
@@ -533,9 +586,19 @@ class ReActAgent:
 
             if parsed.kind == "final":
                 report = parsed.final if isinstance(parsed.final, dict) else {}
+                nudge = self._early_final_nudge(ctx, report, tools_used)
+                if nudge:
+                    # Not accepted yet — but remembered, so refusing can only
+                    # ever buy turns, never lose the report.
+                    self._early_rejections += 1
+                    self._refused_final = dict(report)
+                    report = {}
+                    ctx.messages.append({"role": "user", "content": nudge})
+                    continue
                 ctx.stop_reason = "final"
                 break
 
+            tools_used.add(getattr(parsed, "tool", None))
             observation = self._observe(ctx, parsed)
             ctx.observations.append(observation)
             ctx.messages.append({"role": "user", "content": observation})
@@ -558,6 +621,28 @@ class ReActAgent:
         # runner stamps its own `agent_end` with the timing it measured.
         self.trace.emit("agent_end", stop_reason=ctx.stop_reason, steps=ctx.step + 1)
         return report
+
+    def _early_final_nudge(self, ctx: AgentContext, report: dict, tools_used: set) -> str:
+        """The nudge to send back instead of accepting `report`, or "".
+
+        A real endpoint, given the frozen prompt, writes "không đủ căn cứ"
+        on turn one without looking. The mock never does: it only writes a
+        FINAL after its plan or under `FINALIZE_SENTINEL`, i.e. with the
+        budget spent — so on the practice path this never fires.
+        """
+        if self._early_rejections >= MAX_EARLY_FINAL_REJECTIONS:
+            return ""
+        limit = ctx.max_tool_calls
+        # Keep at least a search, a fetch and the submit in hand.
+        if limit is not None and ctx.tools.calls >= limit - 3:
+            return ""
+        if not (tools_used - {None}):
+            return EARLY_FINAL_NUDGE_NO_TOOLS
+        claims = report.get("claims") if isinstance(report, dict) else None
+        gave_up = report.get("abstain") is True or not claims
+        if gave_up and "fetch_doc" not in tools_used:
+            return EARLY_FINAL_NUDGE_NO_FETCH
+        return ""
 
     # -- reading the model ---------------------------------------------
 

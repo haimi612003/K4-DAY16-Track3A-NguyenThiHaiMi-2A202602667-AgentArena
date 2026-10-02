@@ -70,6 +70,7 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+from harness.layers.citation_checker import on_one_line
 from harness.middleware import Middleware
 
 
@@ -79,16 +80,88 @@ class Critic(Middleware):
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims:
+            claims = []
+        kept, dropped = [], 0
+        for claim in claims:
+            text = claim.get("text") if isinstance(claim, dict) else None
+            if not isinstance(text, str) or not text:
+                dropped += 1
+            elif ctx.saw(text):
+                kept.append(claim)  # có căn cứ: giữ nguyên, KHÔNG sửa chữ
+            elif trimmed := self._trim_to_evidence(ctx, claim, text):
+                kept.append(trimmed)  # chỉ CẮT bớt hai đầu, không đổi chữ
+            elif halves := self._split_glued(ctx, text):
+                kept.extend(halves)
+                report["abstain"] = True  # hai nguồn mâu thuẫn
+            else:
+                dropped += 1  # bịa: bỏ đi
+        ctx.state["critic_dropped"] = dropped
+        report["claims"] = kept
+        if not kept:
+            report["abstain"] = True
+            report["answer"] = (
+                "Không đủ căn cứ trong các tài liệu đã đọc để trả lời câu hỏi này."
+            )
+        report["citations"] = sorted({c["doc_id"] for c in kept if c.get("doc_id")})
+        return report
+
+    @staticmethod
+    def _trim_to_evidence(ctx, claim, text):
+        """Model thật hay bọc claim trong nháy, in đậm hoặc thêm dấu chấm cuối.
+
+        Cắt các ký tự đó ở HAI ĐẦU — phần còn lại là substring của chữ mô
+        hình viết, nên vẫn giữ provenance (README §7.1: cắt thì được).
+        """
+        core = text.strip(TRIM_CHARS)
+        if core == text or len(core) < MIN_TRIM_CHARS or not ctx.saw(core):
+            return None
+        doc = ctx.corpus.get(claim.get("doc_id")) if ctx.corpus is not None else None
+        doc_id = claim.get("doc_id")
+        if doc is None or not on_one_line(core, doc.body):
+            # citation_checker chạy trước, khi chữ chưa cắt nên chưa khớp dòng nào.
+            doc_id = _source(ctx, core) or doc_id
+        return {**claim, "text": core, "doc_id": doc_id}
+
+    @staticmethod
+    def _split_glued(ctx, text):
+        """Tách câu ghép "A và B" thành hai claim, mỗi nửa thuộc một tài liệu khác nhau.
+
+        Cắt ĐÚNG tại vị trí liên từ chứ không `split()`: nửa sau có thể tự
+        bắt đầu bằng "và …" ("… mỗi tuần và và chỉ được …").
+        """
+        pos = text.find(GLUE)
+        while pos != -1:
+            left, right = text[:pos], text[pos + len(GLUE):]
+            if ctx.saw(left) and ctx.saw(right):
+                left_doc, right_doc = _source(ctx, left), _source(ctx, right)
+                if left_doc and right_doc and left_doc != right_doc:
+                    return [
+                        {"text": left, "doc_id": left_doc},
+                        {"text": right, "doc_id": right_doc},
+                    ]
+            pos = text.find(GLUE, pos + 1)
+        return None
+
+
+#: Liên từ mô hình dùng để dán hai nửa câu của hai tài liệu khác nhau.
+GLUE = " và "
+
+#: Ký tự bao quanh mà model thật hay thêm vào claim: khoảng trắng, nháy,
+#: in đậm/markdown, dấu câu cuối.
+TRIM_CHARS = " \t\r\n\"'“”‘’«»*_`.,;:!?…"
+
+#: Ngắn hơn mức này thì phần còn lại không còn là một khẳng định có nghĩa.
+MIN_TRIM_CHARS = 20
+
+
+def _source(ctx, text):
+    """doc_id của tài liệu đã quan sát trọn vẹn có một dòng chứa `text`."""
+    if ctx.corpus is None:
+        return None
+    observed = ctx.observed_text
+    for doc in ctx.corpus.docs:
+        if doc.body in observed and on_one_line(text, doc.body):
+            return doc.doc_id
+    return None
